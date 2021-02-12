@@ -1,4 +1,5 @@
 (#%require (only racket/base error))
+(define call/cc call-with-current-continuation)
 ;;; file: s450.scm
 ;;;
 ;;; Metacircular evaluator from chapter 4 of STRUCTURE AND
@@ -34,11 +35,10 @@
 ;;;
 ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
 
-;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
-;;;
-;;;	 xeval and xapply -- the kernel of the metacircular evaluator
-;;;
-;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
+;---------------------------------------
+;------ Special forms Table ------------
+;---------------------------------------
+
 (define (make-table)
   (list '*table*))
 
@@ -72,10 +72,12 @@
                                 (cond((lookup-action (cadr exp))
                                       "cannot reassign special form")
                                      (else (eval-assessment exp env)))))
+
 (install-special-form 'define (lambda (exp env)
                                 (cond((lookup-action (cadr exp))
                                       "cannot reassign special form")
                                      (else (eval-definition exp env)))))
+
 (install-special-form 'if (lambda (exp env) (eval-if exp env)))
 (install-special-form 'begin (lambda (exp env) (eval-sequence exp env)))
 (install-special-form 'cond (lambda (exp env) (cond->if exp)))
@@ -85,10 +87,21 @@
 (install-special-form 'locally-defined? (lambda (exp env) (locally-defined? exp env)))
 (install-special-form 'locally-make-unbound! (lambda (exp env) (locally-make-unbound! exp env)))
 (install-special-form 'make-unbound! (lambda (exp env) (make-unbound! exp env)))
-                                               
+(install-special-form 'delayed (lambda (exp env) (delayed exp env)))
+(install-special-form 'cons-stream (lambda (exp env) (cons-stream exp env)))
+(install-special-form 'load (lambda (exp env) eval-load))
+;--------------------------------
+;--- xeval and xapply -----------
+;--------------------------------
+                 
 ;we might need quote
 
 (define (xeval exp env)
+  ;(newline)(display "expression")(newline)
+  ;(display exp)(newline)
+  ;(display "-------------------------")
+  ;(newline)(display "environment")
+  ;(display env)
   (cond ((self-evaluating? exp) exp)
         ((variable? exp)
          (cond((lookup-action exp)
@@ -97,21 +110,12 @@
               (else (lookup-variable-value exp env))))
         ((lookup-action (car exp))
          ((lookup-action (car exp)) exp env))
-         ;(let*((arg (car(cdr exp))))
-           ;(display "This is the expression")
-           ;(display exp)
-           ;(newline)
-           ;(display "this is car(cdr)")
-           ;(display arg)
-           ;(cond ((lookup-action arg)
-            ;      error "cannot re-assign special form")
-                 ;(else ((lookup-action (car exp)) exp env)))))
+        ((thunk? exp) (force-it exp))
         ((application? exp)
-         ;(display "I got here1")
          (xapply (xeval (operator exp) env)
-                 (list-of-values (operands exp) env)))
+                 (list-of-values exp env)))
         (else
-         (error "Unknown expression type--XEVAL"))))
+         (s450error exp))))
 
 (define (xapply procedure arguments)
   (cond ((primitive-procedure? procedure)
@@ -120,31 +124,58 @@
          (eval-sequence
            (procedure-body procedure)
            (xtend-environment
-             (procedure-parameters procedure)
+             (remove-tag (procedure-parameters procedure))
              arguments
              (procedure-environment procedure))))
         (else
          (error
-          "Unknown procedure type -- XAPPLY "))))
+          (s450error exp)))))
 
-;;; Handling procedure arguments
+(define (remove-tag lst)
+  (cond((equal? lst '()) '())
+       ((pair? (car lst))
+        (cons (car(cdr(car lst)))
+              (remove-tag (cdr lst))))
+       (else (cons (car lst)
+                   (remove-tag (cdr lst))))))
+;------------------------------------
+;--- Handling procedure arguments ---
+;------------------------------------
 
 (define (list-of-values exps env)
+  (let* ((proc-name (car exps)))
+    (if(not(user-defined-procedure? (lookup-variable-value proc-name env)))
+       (old-list-of-vals (cdr exps) env)
+       (new-list-of-vals exps env))))
+
+;might need to check for special form
+
+(define (new-list-of-vals exps env)
+  (let*((proc-name (car exps))
+        (parameters (procedure-parameters (lookup-variable-value proc-name env))))
+    (define (list-of-vals-iter new-exp parameters)
+      (cond ((no-operands? new-exp) '())
+            ((delayed? (car parameters))
+             (cons (create-thunk (first-operand new-exp) env)
+                   (list-of-vals-iter (rest-operands new-exp) (cdr parameters))))
+            (else
+             (cons (xeval (first-operand new-exp) env)
+                   (list-of-vals-iter (rest-operands new-exp) (cdr parameters))))))
+    (list-of-vals-iter (cdr exps) parameters)))
+
+(define (old-list-of-vals exps env)
   (if (no-operands? exps)
       '()
       (cons (xeval (first-operand exps) env)
-            (list-of-values (rest-operands exps) env))))
+            (old-list-of-vals (rest-operands exps) env))))
 
-;;; These functions, called from xeval, do the work of evaluating some
-;;; of the special forms:
-
-
-;lst is environment 
-;check local environment if v
+;-------------------------------------
+;--- defined? and locally defined? ---
+;-------------------------------------
+       
+;lst is environment
 (define (check-env-var exp lst)
-  ;(display exp)
   (let*((var (cadr exp)))
-    ;(display var)
     (cond((equal? lst the-empty-environment) #f)
          ((and (symbol? var)
                (equal? var (car lst)))
@@ -159,11 +190,7 @@
          (else #f))))
 
 (define (defined? exp env)
-  ;(display "this is environment")(newline)
-  ;(display env)
   (let*((var (cadr exp)))
-    ;(display "this is var")(newline)
-    ;(display var)
     (cond((equal? env the-empty-environment) #f)
          ((and (symbol? var)
                (check-env-var exp (caar env))) #t)
@@ -189,8 +216,7 @@
           (set-car! vars 0)
           (set-car! vals 0))
          (else (local-iter (cdr vars) (cdr vals) env))))
-    (local-iter vars vals env)))
-        
+    (local-iter vars vals env)))        
 
 (define (locally-make-unbound! exp env)
   (let*((vars (frame-variables (first-frame env)))
@@ -199,16 +225,8 @@
     (define (local-iter vars vals)
     (cond((or(equal? vars '())
              (equal? vals '()))
-          ;(newline)(display "var: ")(display vars) (newline)
-          ;(newline)(display "vals: ")(display vals) (newline)
-          ;(newline)(display "current: ")(display current) (newline)
-          ;(newline)(display "expression: ") (display expr) (newline)
           "variable does not exist")
-         ((equal? (car vars) expr)
-          ;(newline)(display "var: ")(display vars) (newline)
-          ;(newline)(display "vals: ")(display vals) (newline)
-          ;(newline)(display "current: ")(display (car vars)) (newline)
-          ;(newline)(display "expression: ") (display expr) (newline)
+         ((equal? (car vars) expr)   
           (set-car! vars 0)
           (set-car! vals 0)) ; just set to zero 
          (else (local-iter (cdr vars) (cdr vals)))))
@@ -301,7 +319,47 @@
       (caddr exp)
       (make-lambda (cdadr exp)
                    (cddr exp))))
+;-------------------------------
+;----  Representing Thunks -----
+;-------------------------------
+  
+(define (delayed exp env) (list 'delayed exp env))
+(define (create-thunk exp env) (list 'thunk exp env))
+(define (thunk-exp thunk) (cadr thunk))
+(define (thunk-env thunk) (caddr thunk))
+(define (delayed? obj) (tagged-list? obj 'delayed))
+(define (thunk? obj) (tagged-list? obj 'thunk))
+(define (evaluated-thunk? obj) (tagged-lisit obj 'evaluated))
+(define (thunk-val evaluated-thunk) (cadr evaluated-thunk))
+(define (force-it thunk) (xeval thunk-exp thunk-env))
 
+;-------------------------------
+;--- Representing Streams ------
+;-------------------------------
+
+;;stream has format (define ones (cons 1 (delay ones))
+;; our expression would be (cons-stream elmt strm)
+
+(define (cons-stream exp env) (cons (cadr exp) (force-it(caddr exp))))
+(define (stream-car stream) (car stream))
+(define (stream-cdr stream) (force-it (cdr stream)))
+(define the-empty-stream '())
+(define (stream-null? x) (null? x) )
+
+
+;-----------------------------------------
+;---- Representing Dynamic arguements ----
+;-----------------------------------------
+
+;dynamic environment global variable
+;this environment is a list of frames
+;any time you invoke a function push into to the dynamic environment using cons
+;in a last in first out order
+;what does xtend environment do and return?
+
+(define the-dynamic-environment '())
+(define (dynamic? exp) (tagged-list? exp 'dynamic))
+                           
 ;;; lambda expressions -- represented as (lambda ...)
 ;;;
 ;;; That is, any list starting with lambda.  The list must have at
@@ -398,18 +456,22 @@
 ;;;	 Truth values and procedure objects
 ;;;
 ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
-
-;;; Truth values
+  
+;--------------------------
+;------Truth values--------
+;--------------------------
 
 (define (true? x)
   (not (eq? x #f)))
 
 (define (false? x)
   (eq? x #f))
+  
+;-----------------------------------
+;----- Working with Procedures -----
+;-----------------------------------
 
-
-;;; Procedures
-
+  
 (define (make-procedure parameters body env)
   (list 'procedure parameters body env))
 
@@ -428,10 +490,12 @@
 
 ;;; An environment is a list of frames.
 
+;----------------------------------
+;----- Environment Selectors ------
+;----------------------------------
+
 (define (enclosing-environment env) (cdr env))
-
 (define (first-frame env) (car env))
-
 (define the-empty-environment '())
 
 ;;; Each frame is represented as a pair of lists:
@@ -450,14 +514,22 @@
 
 ;;; Extending an environment
 
+;----------------------------------
+;---- xtend-environment -----------
+;----------------------------------
+
+;creating a new frame with a set of variables and values
+
 (define (xtend-environment vars vals base-env)
   (if (= (length vars) (length vals))
       (cons (make-frame vars vals) base-env)
       (if (< (length vars) (length vals))
           (error "Too many arguments supplied ")
           (error "Too few arguments supplied "))))
-
-;;; Looking up a variable in an environment
+  
+;---------------------------------------------------
+;---- Looking up a variable in an environment ------
+;---------------------------------------------------
 
 (define (lookup-variable-value var env)
   (define (env-loop env)
@@ -467,7 +539,8 @@
       (cond ((null? vars)
              (env-loop (enclosing-environment env)))
             ((eq? var (car vars))
-             (car vals))
+             (cond((thunk? vals) (force-it vals))
+                  (else (car vals))))
             (else (scan (cdr vars) (cdr vals)))))
     (if (eq? env the-empty-environment)
         (error "Unbound variable ")
@@ -538,7 +611,6 @@
          (set-cdr! (first-frame the-global-environment)
                    (cons (list 'primitive proc) (cdar the-global-environment)))
          tag)))
-                   
 
 (define (primitive-procedure? proc)
   (tagged-list? proc 'primitive))
@@ -561,16 +633,37 @@
 ;;; the evaluation.  In this case, our evaluator is called xeval.
 
 (define input-prompt "s450==> ")
-
+(define target '())
+(define psswd 'still-here)
+  
+;---------------------
+;---- Main-loop ------
+;---------------------
+  
 (define (s450)
   (prompt-for-input input-prompt)
   (let ((input (read)))
-    (let ((output (xeval input the-global-environment)))
-      (user-print output)))
-  (s450))
-
+    (call/cc (lambda (here) (set! target here)))
+    (cond ((equal? psswd 'leave)
+           (set! psswd 'still-here)
+           (display "Thanks for using my metacircular evaluator"))
+          ((eof-object? input)
+           (exit))
+          (else
+           (let((output (xeval input the-global-environment)))
+             (user-print output)
+             (s450))))))
+                        
 (define (prompt-for-input string)
   (newline) (newline) (display string))
+
+(define (exit) (set! psswd 'leave)
+  (call/cc target))
+
+(define (s450error args)
+  (map (lambda (x) (display "Invalid arguement: ")
+         (display x)(newline)) args))
+  
 
 ;;; Note that we would not want to try to print a representation of the
 ;;; <procedure-env> below -- this would in general get us into an
@@ -591,12 +684,15 @@
 ;;;
 ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
 
-(display "... loaded the metacircular evaluator. (s450) runs it.")
+(display "... loaded the metacircular evaluator. (s450) runs it.") 
 (newline)
 
 (define the-global-environment (setup-environment))
 (define tge the-global-environment)
-
+  
+;-----------------------------------------
+;---- Installing Primtive Procedures -----
+;-----------------------------------------
 
 (install-primitive-procedure 'cons cons)
 (install-primitive-procedure 'cdr cdr)
@@ -608,6 +704,11 @@
 (install-primitive-procedure '- -)
 (install-primitive-procedure '+ +)
 (install-primitive-procedure 'equal? equal?)
+(install-primitive-procedure 'exit exit)
+(install-primitive-procedure 'stream-car stream-car)
+(install-primitive-procedure 'stream-cdr stream-cdr)
+;(install-primitive-procedure 'stream-null stream-null)
+
 
 
 
